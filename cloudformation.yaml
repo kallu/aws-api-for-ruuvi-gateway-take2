@@ -1,0 +1,366 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS API for Ruuvi Gateway sensor data storage and processing'
+
+Parameters:
+  
+  ApiStageName:
+    Type: String
+    Default: v1
+    Description: API Gateway stage name
+
+Resources:
+  # DynamoDB table for storing sensor data
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'ruuvi-sensor-data-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tag_id
+          AttributeType: S
+        - AttributeName: measurementSequenceNumber
+          AttributeType: N
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: tag_id
+          KeyType: HASH
+        - AttributeName: measurementSequenceNumber
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: TimestampIndex
+          KeySchema:
+            - AttributeName: tag_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB table for latest readings per tag
+  LatestReadingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'ruuvi-latest-readings-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tag_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tag_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # CloudWatch Logs group for Lambda function
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/ruuvi-sensor-processor-${AWS::StackName}'
+      RetentionInDays: 14
+
+  # Lambda function for processing sensor data
+  SensorDataProcessor:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      FunctionName: !Sub 'ruuvi-sensor-processor-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          SENSOR_DATA_TABLE: !Ref SensorDataTable
+          LATEST_READINGS_TABLE: !Ref LatestReadingsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+          from decimal import Decimal
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['SENSOR_DATA_TABLE'])
+          latest_table = dynamodb.Table(os.environ['LATEST_READINGS_TABLE'])
+          
+          def convert_floats_to_decimal(obj):
+              """Recursively convert float values to Decimal for DynamoDB compatibility"""
+              if isinstance(obj, list):
+                  return [convert_floats_to_decimal(item) for item in obj]
+              elif isinstance(obj, dict):
+                  return {key: convert_floats_to_decimal(value) for key, value in obj.items()}
+              elif isinstance(obj, float):
+                  return Decimal(str(obj))
+              else:
+                  return obj
+          
+          def lambda_handler(event, context):
+              try:
+                  # Parse the incoming payload
+                  body = json.loads(event['body']) if isinstance(event.get('body'), str) else event.get('body', {})
+                  data = body.get('data', {})
+                  
+                  # Extract gateway information
+                  gateway_mac = data.get('gw_mac')
+                  gateway_timestamp = data.get('timestamp')
+                  
+                  if not gateway_mac or not gateway_timestamp:
+                      print(f"Missing required fields - Full request payload: {json.dumps(event, default=str)}")
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({
+                              'error': 'Missing required fields: gw_mac or timestamp',
+                              'request_payload': event
+                          })
+                      }
+                  
+                  # Process each sensor tag
+                  tags = data.get('tags', {})
+                  processed_count = 0
+                  
+                  for tag_id, tag_data in tags.items():
+                      # Validate required fields
+                      measurement_seq = tag_data.get('measurementSequenceNumber')
+                      if measurement_seq is None:
+                          print(f"Skipping tag {tag_id} - missing measurementSequenceNumber")
+                          continue
+                      
+                      # Add TTL (90 days from now)
+                      ttl = int((datetime.now() + timedelta(days=90)).timestamp())
+                      
+                      # Extract required fields
+                      item = {
+                          'tag_id': tag_data.get('id', tag_id),
+                          'measurementSequenceNumber': measurement_seq,
+                          'timestamp': tag_data.get('timestamp', gateway_timestamp),
+                          'gateway_mac': gateway_mac,
+                          'ttl': ttl
+                      }
+                      
+                      # Add optional sensor fields (convert floats to Decimal)
+                      if tag_data.get('temperature') is not None:
+                          item['temperature'] = Decimal(str(tag_data['temperature']))
+                      if tag_data.get('humidity') is not None:
+                          item['humidity'] = Decimal(str(tag_data['humidity']))
+                      if tag_data.get('pressure') is not None:
+                          item['pressure'] = Decimal(str(tag_data['pressure']))
+                      if tag_data.get('voltage') is not None:
+                          item['voltage'] = Decimal(str(tag_data['voltage']))
+                      
+                      # Store in main table
+                      table.put_item(Item=item)
+                      
+                      # Update latest readings table (overwrites if newer)
+                      latest_table.put_item(Item=item)
+                      
+                      processed_count += 1
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {processed_count} sensor readings',
+                          'gateway_mac': gateway_mac,
+                          'timestamp': gateway_timestamp
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_msg = f"Error processing sensor data: {str(e)}"
+                  print(f"{error_msg} - Full request payload: {json.dumps(event, default=str)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'error_details': str(e),
+                          'request_payload': event
+                      })
+                  }
+
+  # IAM role for Lambda execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ruuvi-lambda-execution-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt SensorDataTable.Arn
+                  - !Sub '${SensorDataTable.Arn}/index/*'
+                  - !GetAtt LatestReadingsTable.Arn
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ruuvi-sensor-processor-${AWS::StackName}:*'
+
+  # API Gateway REST API
+  RuuviApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'ruuvi-gateway-api-${AWS::StackName}'
+      Description: API for receiving Ruuvi Gateway sensor data
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway resource for sensor data
+  SensorDataResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ParentId: !GetAtt RuuviApi.RootResourceId
+      PathPart: sensor-data
+
+  # API Gateway method for POST requests
+  SensorDataMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref SensorDataResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SensorDataProcessor.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+        - StatusCode: 500
+
+  # API Gateway method for GET requests (health check)
+  SensorDataGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref SensorDataResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                {
+                  "status": "ok",
+                  "message": "Ruuvi Gateway API is running",
+                  "timestamp": "$context.requestTime"
+                }
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway method for OPTIONS requests (CORS)
+  SensorDataOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref SensorDataResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # Lambda permission for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SensorDataProcessor
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RuuviApi}/*/*'
+
+  # API Gateway deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - SensorDataMethod
+      - SensorDataGetMethod
+      - SensorDataOptionsMethod
+    Properties:
+      RestApiId: !Ref RuuviApi
+      Description: !Sub 'Deployment at ${AWS::StackName}'
+  
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RuuviApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref ApiStageName
+      Description: !Sub '${AWS::StackName} stage for Ruuvi Gateway API'
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${RuuviApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}/sensor-data'
+  
+  ApiBaseUrl:
+    Description: API Gateway base URL
+    Value: !Sub 'https://${RuuviApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}'
+  
+  SensorDataTableName:
+    Description: DynamoDB table name for sensor data
+    Value: !Ref SensorDataTable
+
+  LatestReadingsTableName:
+    Description: DynamoDB table name for latest readings per tag
+    Value: !Ref LatestReadingsTable
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt SensorDataProcessor.Arn
