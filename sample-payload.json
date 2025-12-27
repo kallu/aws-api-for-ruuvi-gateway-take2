@@ -3,7 +3,7 @@
     "coordinates": "",
     "timestamp": 1761484468,
     "nonce": 165935724,
-    "gw_mac": "D4:09:4D:EC:54:C5",
+    "gw_mac": "DE:AD:BE:EF:01:23",
     "tags": {
       "DC:8B:E7:24:29:6F": {
         "rssi": -46,
