@@ -225,6 +225,199 @@ Resources:
                   - logs:PutLogEvents
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ruuvi-sensor-processor-${AWS::StackName}:*'
 
+  # CloudWatch Logs group for Read Lambda function
+  ReadLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/ruuvi-data-reader-${AWS::StackName}'
+      RetentionInDays: 14
+
+  # Lambda function for reading sensor data
+  SensorDataReader:
+    Type: AWS::Lambda::Function
+    DependsOn: ReadLambdaLogGroup
+    Properties:
+      FunctionName: !Sub 'ruuvi-data-reader-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt ReadLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          SENSOR_DATA_TABLE: !Ref SensorDataTable
+          LATEST_READINGS_TABLE: !Ref LatestReadingsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from decimal import Decimal
+          
+          dynamodb = boto3.resource('dynamodb')
+          sensor_table = dynamodb.Table(os.environ['SENSOR_DATA_TABLE'])
+          latest_table = dynamodb.Table(os.environ['LATEST_READINGS_TABLE'])
+          
+          class DecimalEncoder(json.JSONEncoder):
+              """Helper class to convert Decimal to float for JSON serialization"""
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+          
+          def lambda_handler(event, context):
+              try:
+                  path = event.get('path', '')
+                  http_method = event.get('httpMethod', '')
+                  path_parameters = event.get('pathParameters') or {}
+                  query_parameters = event.get('queryStringParameters') or {}
+                  
+                  # GET /latest - Get all latest readings
+                  if path.endswith('/latest') and http_method == 'GET':
+                      response = latest_table.scan()
+                      items = response.get('Items', [])
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps({
+                              'count': len(items),
+                              'items': items
+                          }, cls=DecimalEncoder)
+                      }
+                  
+                  # GET /tags/{tagId} - Get specific tag's latest reading
+                  elif '/tags/' in path and http_method == 'GET':
+                      tag_id = path_parameters.get('tagId')
+                      
+                      if not tag_id:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'Missing tagId parameter'})
+                          }
+                      
+                      response = latest_table.get_item(Key={'tag_id': tag_id})
+                      
+                      if 'Item' not in response:
+                          return {
+                              'statusCode': 404,
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',
+                                  'Content-Type': 'application/json'
+                              },
+                              'body': json.dumps({'error': 'Tag not found'})
+                          }
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps(response['Item'], cls=DecimalEncoder)
+                      }
+                  
+                  # GET /tags/{tagId}/history - Get tag history
+                  elif '/history' in path and http_method == 'GET':
+                      tag_id = path_parameters.get('tagId')
+                      limit = int(query_parameters.get('limit', 100))
+                      
+                      if not tag_id:
+                          return {
+                              'statusCode': 400,
+                              'body': json.dumps({'error': 'Missing tagId parameter'})
+                          }
+                      
+                      response = sensor_table.query(
+                          KeyConditionExpression='tag_id = :id',
+                          ExpressionAttributeValues={':id': tag_id},
+                          ScanIndexForward=False,  # Most recent first
+                          Limit=min(limit, 1000)  # Cap at 1000
+                      )
+                      
+                      items = response.get('Items', [])
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps({
+                              'tag_id': tag_id,
+                              'count': len(items),
+                              'items': items
+                          }, cls=DecimalEncoder)
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps({'error': 'Not found'})
+                      }
+                      
+              except Exception as e:
+                  print(f"Error reading sensor data: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'error_details': str(e)
+                      })
+                  }
+
+  # IAM role for Read Lambda execution
+  ReadLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ruuvi-read-lambda-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt SensorDataTable.Arn
+                  - !Sub '${SensorDataTable.Arn}/index/*'
+                  - !GetAtt LatestReadingsTable.Arn
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ruuvi-data-reader-${AWS::StackName}:*'
+
   # API Gateway REST API
   RuuviApi:
     Type: AWS::ApiGateway::RestApi
@@ -315,11 +508,185 @@ Resources:
           ResponseModels:
             application/json: Empty
 
-  # Lambda permission for API Gateway
+  # API Gateway resource for /latest
+  LatestResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ParentId: !GetAtt RuuviApi.RootResourceId
+      PathPart: latest
+
+  # GET /latest method
+  GetLatestMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref LatestResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SensorDataReader.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  # OPTIONS /latest method
+  OptionsLatestMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref LatestResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway resource for /tags
+  TagsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ParentId: !GetAtt RuuviApi.RootResourceId
+      PathPart: tags
+
+  # API Gateway resource for /tags/{tagId}
+  TagIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ParentId: !Ref TagsResource
+      PathPart: '{tagId}'
+
+  # GET /tags/{tagId} method
+  GetTagMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref TagIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SensorDataReader.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 404
+
+  # OPTIONS /tags/{tagId} method
+  OptionsTagMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref TagIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway resource for /tags/{tagId}/history
+  HistoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ParentId: !Ref TagIdResource
+      PathPart: history
+
+  # GET /tags/{tagId}/history method
+  GetHistoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref HistoryResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SensorDataReader.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  # OPTIONS /tags/{tagId}/history method
+  OptionsHistoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RuuviApi
+      ResourceId: !Ref HistoryResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          ResponseModels:
+            application/json: Empty
+
+  # Lambda permission for API Gateway (write operations)
   ApiGatewayLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref SensorDataProcessor
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RuuviApi}/*/*'
+
+  # Lambda permission for API Gateway (read operations)
+  ApiGatewayReadLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SensorDataReader
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RuuviApi}/*/*'
@@ -331,9 +698,14 @@ Resources:
       - SensorDataMethod
       - SensorDataGetMethod
       - SensorDataOptionsMethod
+      - GetLatestMethod
+      - OptionsLatestMethod
+      - GetTagMethod
+      - OptionsTagMethod
+      - GetHistoryMethod
+      - OptionsHistoryMethod
     Properties:
       RestApiId: !Ref RuuviApi
-      Description: !Sub 'Deployment at ${AWS::StackName}'
   
   # API Gateway Stage
   ApiStage:
@@ -342,7 +714,6 @@ Resources:
       RestApiId: !Ref RuuviApi
       DeploymentId: !Ref ApiDeployment
       StageName: !Ref ApiStageName
-      Description: !Sub '${AWS::StackName} stage for Ruuvi Gateway API'
 
 Outputs:
   ApiEndpoint:
